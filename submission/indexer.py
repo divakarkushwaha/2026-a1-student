@@ -1,100 +1,121 @@
-"""
-submission/indexer.py — build your inverted index here.
-
-This is one of the required components (assignment Section 4.1): you must
-build the inverted index yourself, without an existing search/indexing
-library (Lucene, Elasticsearch, Pyserini, Whoosh, etc.).
-
-A `tokenize()` helper is provided below purely so that tokenization is
-consistent across your Boolean/VSM and BM25 scorers —
-feel free to replace it (e.g. add stemming or stopword removal), just make
-sure every scorer that reads this index was built with the same tokenizer.
-
-Everything else — the postings representation, what per-document and
-collection statistics you track, whether you add positions for
-proximity/phrase features — is your design decision. `InvertedIndex`
-below sketches a minimal, obviously-sufficient shape; you do not have to
-use it, but if you do, filling in `build()` and `document_frequency()` is
-enough to support Boolean/VSM and BM25.
-
-Persistence (assignment Section 4.1 / Section 7 "index size" scoring):
-`build_index()` in retrieve.py runs in one process and `load_index()` runs
-in a separate, later one — so whatever this index needs at query time must
-round-trip through `save()`/`load()` below, not just live as Python
-attributes. The on-disk byte size of what `save()` writes is graded
-directly (smaller, relative to the class median, scores better), so a
-compact postings encoding is worth more here than in most course
-assignments — see the `save()` docstring for concrete starting points.
-"""
-import re
-from typing import Dict, List, Tuple
-
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+"""Inverted index with delta+VByte compressed postings."""
+import numpy as np
+import os
+from submission.text import analyze
 
 
-def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-only tokenization."""
-    return _TOKEN_RE.findall(text.lower())
+def _vbyte_encode(nums) -> bytes:
+    out = bytearray()
+    for n in nums:
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            if n:
+                out.append(b)
+            else:
+                out.append(b | 0x80)
+                break
+    return bytes(out)
+
+
+def _vbyte_decode(buf, pos, count):
+    nums = []
+    n = shift = 0
+    while len(nums) < count:
+        b = buf[pos]
+        pos += 1
+        if b & 0x80:
+            n |= (b & 0x7F) << shift
+            nums.append(n)
+            n = shift = 0
+        else:
+            n |= b << shift
+            shift += 7
+    return nums, pos
 
 
 class InvertedIndex:
-    """A minimal inverted index skeleton. Extend the data structures here
-    however your design needs (e.g. term positions for phrase/proximity
-    scoring, a more compact postings representation for the efficiency
-    bonus) — this is a starting point, not a fixed schema.
-    """
-
     def __init__(self):
-        self.postings: Dict[str, Dict[str, int]] = {}  # term -> {doc_id: term_freq}
-        self.doc_len: Dict[str, int] = {}  # doc_id -> number of tokens
-        self.doc_text: Dict[str, str] = {}  # doc_id -> raw text (handy for VSM/debugging)
-        self.N: int = 0  # number of documents
-        self.avg_doc_len: float = 0.0
+        self.doc_ids = []       # internal int -> external doc_id str
+        self.doc_lens = None    # np.uint32 array
+        self.terms = []         # sorted term list
+        self.df = None          # np.uint32, parallel to terms
+        self.offsets = None     # np.uint64, byte offset into postings blob
+        self.postings = b""     # concatenated compressed postings
+        self.N = 0
+        self.avgdl = 0.0
 
-    def build(self, corpus: List[Tuple[str, str]]) -> None:
-        """corpus: list of (doc_id, text) pairs, e.g. from
-        submission.corpus_utils.load_corpus().
+    def build(self, corpus):
+        postings = {}           # term -> [(docint, tf), ...]
+        lens = []
+        for docint, (doc_id, text) in enumerate(corpus):
+            toks = analyze(text)
+            self.doc_ids.append(doc_id)
+            lens.append(len(toks))
+            tfs = {}
+            for t in toks:
+                tfs[t] = tfs.get(t, 0) + 1
+            for t, tf in tfs.items():
+                postings.setdefault(t, []).append((docint, tf))
 
-        TODO(you): tokenize each document, populate self.postings,
-        self.doc_len, self.doc_text, self.N, and self.avg_doc_len.
-        """
-        raise NotImplementedError("Implement InvertedIndex.build() — see assignment Section 4.1.")
+        self.doc_lens = np.array(lens, dtype=np.uint32)
+        self.N = len(self.doc_ids)
+        self.avgdl = float(self.doc_lens.mean()) if self.N else 0.0
 
-    def document_frequency(self, term: str) -> int:
-        """Number of documents containing `term` at least once.
+        self.terms = sorted(postings)
+        df, offs, blob = [], [], bytearray()
+        for t in self.terms:
+            plist = postings[t]          # already in ascending docint order
+            offs.append(len(blob))
+            df.append(len(plist))
+            gaps, prev = [], 0
+            for docint, _ in plist:
+                gaps.append(docint - prev)
+                prev = docint
+            blob += _vbyte_encode(gaps)
+            blob += _vbyte_encode([tf for _, tf in plist])
+        self.df = np.array(df, dtype=np.uint32)
+        self.offsets = np.array(offs, dtype=np.uint64)
+        self.postings = bytes(blob)
 
-        TODO(you): implement using self.postings.
-        """
-        raise NotImplementedError("Implement InvertedIndex.document_frequency().")
-
-    def save(self, index_dir: str) -> None:
-        """Persist everything document_frequency() / your scorers need to
-        `index_dir`, so `load()` can reconstruct this object in a fresh
-        process with no memory of `build()` ever having run. Called from
-        retrieve.build_index().
-
-        The on-disk byte size of whatever you write here is graded
-        directly (assignment Section 7, "index size", relative to the
-        class median) — some starting points, roughly in order of effort:
-          - json/pickle-dump self.postings etc. directly (works, but
-            verbose: repeats every doc_id string per posting).
-          - drop self.doc_text if your scorers don't need raw text at
-            query time (BM25/VSM only need term-frequency and length
-            statistics, not the original documents).
-          - delta-encode each postings list's doc-ids (sorted ascending,
-            store gaps instead of absolute ids) and varint/byte-pack them,
-            instead of a naive JSON list of integers.
-
-        TODO(you): implement.
-        """
-        raise NotImplementedError("Implement InvertedIndex.save() — see assignment Section 4.1.")
+    def save(self, index_dir):
+        os.makedirs(index_dir, exist_ok=True)
+        with open(os.path.join(index_dir, "terms.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(self.terms))
+        with open(os.path.join(index_dir, "docids.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(self.doc_ids))
+        with open(os.path.join(index_dir, "postings.bin"), "wb") as f:
+            f.write(self.postings)
+        np.savez(os.path.join(index_dir, "meta.npz"),
+                 df=self.df, offsets=self.offsets, doc_lens=self.doc_lens)
 
     @classmethod
-    def load(cls, index_dir: str) -> "InvertedIndex":
-        """Reconstruct an InvertedIndex purely from what save() wrote to
-        `index_dir`. Called in a fresh process — do not rely on any state
-        other than what's actually on disk in `index_dir`.
+    def load(cls, index_dir):
+        ix = cls()
+        with open(os.path.join(index_dir, "terms.txt"), encoding="utf-8") as f:
+            ix.terms = f.read().split("\n")
+        with open(os.path.join(index_dir, "docids.txt"), encoding="utf-8") as f:
+            ix.doc_ids = f.read().split("\n")
+        with open(os.path.join(index_dir, "postings.bin"), "rb") as f:
+            ix.postings = f.read()
+        m = np.load(os.path.join(index_dir, "meta.npz"))
+        ix.df, ix.offsets, ix.doc_lens = m["df"], m["offsets"], m["doc_lens"]
+        ix.N = len(ix.doc_ids)
+        ix.avgdl = float(ix.doc_lens.mean()) if ix.N else 0.0
+        ix.term_ids = {t: i for i, t in enumerate(ix.terms)}
+        return ix
 
-        TODO(you): implement, matching whatever format save() wrote.
-        """
-        raise NotImplementedError("Implement InvertedIndex.load() — see assignment Section 4.1.")
+    def get_postings(self, term):
+        """Return (docints, tfs) or None."""
+        i = self.term_ids.get(term)
+        if i is None:
+            return None
+        pos = int(self.offsets[i])
+        n = int(self.df[i])
+        gaps, pos = _vbyte_decode(self.postings, pos, n)
+        tfs, _ = _vbyte_decode(self.postings, pos, n)
+        docints, cur = [], 0
+        for g in gaps:
+            cur += g
+            docints.append(cur)
+        return docints, tfs

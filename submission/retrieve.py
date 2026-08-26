@@ -58,6 +58,7 @@ def load_index(index_dir: str) -> None:
     """
     global _INDEX
     _INDEX = InvertedIndex.load(index_dir)
+    _INDEX.decode_all()
     bm25.build(_INDEX, k1=1.2, b=0.75)
 
 

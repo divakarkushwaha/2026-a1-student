@@ -21,3 +21,8 @@ rank_bm25>=0.2.2
 # Optional: if you want to cross-check this harness's metrics against the
 # standard TREC tool. Not required.
 # pytrec_eval>=0.5
+
+# Porter stemmer for submission/text.py
+nltk>=3.8
+# Array operations in the indexer and BM25 scorer
+numpy>=1.24

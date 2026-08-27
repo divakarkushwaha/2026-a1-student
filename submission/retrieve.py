@@ -59,7 +59,7 @@ def load_index(index_dir: str) -> None:
     global _INDEX
     _INDEX = InvertedIndex.load(index_dir)
     _INDEX.decode_all()
-    bm25.build(_INDEX, k1=1.2, b=0.75)
+    bm25.build(_INDEX, k1=2.0, b=0.6)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:

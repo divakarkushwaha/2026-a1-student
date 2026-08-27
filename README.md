@@ -1,3 +1,82 @@
+# My Submission
+
+BM25 retriever over a from-scratch inverted index with delta + variable-byte compressed postings. Dev-set results on the TREC-COVID corpus (171,332 documents, 50 topics):
+
+| Metric | Value |
+|---|---|
+| nDCG@10 | 0.6450 |
+| MAP@10 | 0.0161 |
+| MRR | 0.8933 |
+| P@10 | 0.7220 |
+| Index build time | 21.5 s |
+| Index load time | 5.1 s |
+| Index size on disk | 32.2 MB |
+| Mean query latency | 2.1 ms |
+
+## Reproducing
+
+```bash
+python -m venv .venv
+source .venv/bin/activate            # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Fetch the corpus into `data/full/` (needs network; not required for the toy set):
+
+```bash
+python scripts/download_full_corpus.py
+```
+
+Full harness run:
+
+```bash
+python -m harness.run_harness \
+  --corpus data/full/corpus.jsonl \
+  --queries data/full/queries_dev.tsv \
+  --qrels data/full/qrels_dev.txt \
+  --run-out runs/full_run.trec \
+  --report-out runs/full_report.json
+```
+
+Tests (interface conformance, metrics, and my Boolean/VSM unit tests):
+
+```bash
+pytest tests/ -v
+```
+
+Parameter sweep (builds the index once, re-scores across `k1`/`b`):
+
+```bash
+python scripts/tune.py
+```
+
+Both `build_index()` and `load_index()` are deterministic: term ordering is lexicographic, document ids are assigned in corpus order, and ties in `retrieve()` break by ascending internal document id.
+
+## Files I wrote
+
+| File | Contents |
+|---|---|
+| `submission/text.py` | Shared analyzer (lowercase, alphanumeric tokens, stopword removal, Porter stemming with memoisation). Imported by both the indexer and every scorer so index-time and query-time tokenisation cannot drift apart. |
+| `submission/indexer.py` | `InvertedIndex`: postings construction, delta + VByte compression, `save()`/`load()`, and `decode_all()`. |
+| `submission/bm25.py` | BM25 with tunable `k1`, `b`; vectorised scoring. |
+| `submission/boolean_vsm.py` | Boolean AND/OR over postings; `lnc.ltc` TF-IDF cosine ranking. |
+| `scripts/tune.py` | Parameter sweep using the harness's own metrics. |
+| `tests/test_boolean_vsm.py` | Hand-verified unit tests for Boolean and VSM. |
+
+## Design decisions
+
+**Compressed postings.** Document ids within a postings list are ascending, so I store gaps rather than absolute ids and variable-byte encode them — one byte per value under 128 instead of four. Raw document text is deliberately not persisted: BM25 and VSM need only term frequencies and document lengths.
+
+**Decode once at load.** The compressed blob is the on-disk form; `decode_all()` expands it into flat NumPy arrays at load time so query scoring is array slicing with no per-posting Python loop. This traded ~0.8 s of load time for a drop in mean query latency from 162 ms to 2.1 ms.
+
+**Parameters.** `k1=2.0, b=0.6`, chosen from a joint sweep (see `docs/sweep_refined.json`). The nominal dev-set maximum was `k1=2.2, b=0.65` at 0.6503, but the surface is flat across `k1 ∈ [1.8, 2.5]`, `b ∈ [0.5, 0.7]` — differences under ~0.005 on 50 queries are noise, so I chose central values rather than the argmax to avoid overfitting the dev set.
+
+**VSM norms.** Document vector norms are recomputed at load rather than persisted, keeping them off the index-size metric at a cost of under one second.
+
+---
+
+
+
 # A1 — Sparse Retrieval Arena: Starter Repository
 
 This is the starter repository for **Assignment 1: Sparse Retrieval

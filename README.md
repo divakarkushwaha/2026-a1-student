@@ -1,17 +1,17 @@
 # My Submission
 
-BM25 retriever over a from-scratch inverted index with delta + variable-byte compressed postings. Dev-set results on the TREC-COVID corpus (171,332 documents, 50 topics):
+BM25 with RM3 pseudo-relevance feedback, over a from-scratch inverted index with delta + variable-byte compressed postings. Dev-set results on the TREC-COVID corpus (171,332 documents, 50 topics):
 
 | Metric | Value |
 |---|---|
-| nDCG@10 | 0.6450 |
-| MAP@10 | 0.0161 |
-| MRR | 0.8933 |
-| P@10 | 0.7220 |
-| Index build time | 21.5 s |
-| Index load time | 5.1 s |
-| Index size on disk | 32.2 MB |
-| Mean query latency | 2.1 ms |
+| nDCG@10 | 0.7438 |
+| MAP@10 | 0.0190 |
+| MRR | 0.9450 |
+| P@10 | 0.8140 |
+| Index build time | 20.5 s |
+| Index load time | 6.1 s |
+| Index size on disk | 30.7 MB |
+| Mean query latency | 12.0 ms |
 
 ## Reproducing
 
@@ -44,10 +44,13 @@ Tests (interface conformance, metrics, and my Boolean/VSM unit tests):
 pytest tests/ -v
 ```
 
-Parameter sweep (builds the index once, re-scores across `k1`/`b`):
+Parameter sweeps. Each builds the index once and re-scores across a grid, writing `runs/sweep_<name>.json`:
 
 ```bash
-python scripts/tune.py
+python scripts/tune.py bm25        # k1 x b, plain BM25
+python scripts/tune.py rm3         # fb_docs x fb_terms x lambda
+python scripts/tune.py k1b_rm3     # k1 x b, with RM3 active
+python scripts/top.py rm3 15       # rank a sweep's configurations
 ```
 
 Both `build_index()` and `load_index()` are deterministic: term ordering is lexicographic, document ids are assigned in corpus order, and ties in `retrieve()` break by ascending internal document id.
@@ -57,10 +60,12 @@ Both `build_index()` and `load_index()` are deterministic: term ordering is lexi
 | File | Contents |
 |---|---|
 | `submission/text.py` | Shared analyzer (lowercase, alphanumeric tokens, stopword removal, Porter stemming with memoisation). Imported by both the indexer and every scorer so index-time and query-time tokenisation cannot drift apart. |
-| `submission/indexer.py` | `InvertedIndex`: postings construction, delta + VByte compression, `save()`/`load()`, and `decode_all()`. |
+| `submission/indexer.py` | `InvertedIndex`: postings construction, delta + VByte compression, `save()`/`load()`, `decode_all()`, and `build_forward()`. |
 | `submission/bm25.py` | BM25 with tunable `k1`, `b`; vectorised scoring. |
 | `submission/boolean_vsm.py` | Boolean AND/OR over postings; `lnc.ltc` TF-IDF cosine ranking. |
-| `scripts/tune.py` | Parameter sweep using the harness's own metrics. |
+| `submission/custom_scorer.py` | RM3 pseudo-relevance feedback over BM25 — the submitted scorer. |
+| `scripts/tune.py` | Parameterised sweep runner using the harness's own metrics. |
+| `scripts/top.py` | Ranks a sweep's configurations by nDCG@10. |
 | `tests/test_boolean_vsm.py` | Hand-verified unit tests for Boolean and VSM. |
 
 ## Design decisions
@@ -69,10 +74,15 @@ Both `build_index()` and `load_index()` are deterministic: term ordering is lexi
 
 **Decode once at load.** The compressed blob is the on-disk form; `decode_all()` expands it into flat NumPy arrays at load time so query scoring is array slicing with no per-posting Python loop. This traded ~0.8 s of load time for a drop in mean query latency from 162 ms to 2.1 ms.
 
-**Parameters.** `k1=2.0, b=0.6`, chosen from a joint sweep (see `docs/sweep_refined.json`). The nominal dev-set maximum was `k1=2.2, b=0.65` at 0.6503, but the surface is flat across `k1 ∈ [1.8, 2.5]`, `b ∈ [0.5, 0.7]` — differences under ~0.005 on 50 queries are noise, so I chose central values rather than the argmax to avoid overfitting the dev set.
+**RM3 pseudo-relevance feedback.** The final scorer runs BM25, treats the top 50 results as pseudo-relevant, estimates a relevance model `p(t|R) = SUM_d P(d)·tf(t,d)/|d|` over them, and re-scores with the top 40 expansion terms interpolated against the original query at λ=0.35. This was the single largest gain in the assignment: dev nDCG@10 went from 0.6450 to 0.7255. The forward index it needs (document → terms) is inverted from the postings at load time rather than persisted, so it costs load time instead of index size.
+
+**Stopwords.** NLTK's English list, embedded in `text.py` as a literal rather than loaded through `nltk.corpus`: the grading container runs with `--network none` and no `nltk_data`, so a runtime download would fail. Replacing my initial ~40-word list raised dev nDCG@10 from 0.7255 to 0.7438 and shrank the index from 32.2 MB to 30.7 MB. The gain compounds with RM3 — with 40 expansion terms, function words like "between" were occupying slots that now go to domain vocabulary.
+
+**Parameters.** `k1=2.0, b=0.6` for BM25; `fb_docs=50, fb_terms=40, λ=0.35` for RM3. All chosen from joint grid sweeps on the dev set (`runs/sweep_*.json`). In both cases the nominal maximum was slightly higher than the chosen value — `k1=1.8, b=0.5` scored 0.7283 against 0.7255, and `λ=0.4` scored 0.7262 against 0.7255 — but the surfaces are flat: the top ten `k1`/`b` configurations span only 0.009, and the ranking is non-monotonic in ways a real optimum would not be. On 50 queries, differences under ~0.005 are noise, so I took central values from each plateau rather than the argmax, to avoid overfitting the dev set ahead of the held-out evaluation. `fb_terms=40` was kept at its maximum because it dominated 14 of the top 15 configurations — that one is signal, not noise.
 
 **VSM norms.** Document vector norms are recomputed at load rather than persisted, keeping them off the index-size metric at a cost of under one second.
 
+---
 ---
 
 

@@ -1,7 +1,17 @@
-import json
+"""Rank a sweep's configurations by nDCG@10.
 
-r = json.load(open("runs/sweep_rm3.json"))
-r.sort(key=lambda x: -x["ndcg@10"])
-for x in r[:15]:
-    print(f"docs={x['fb_docs']:<4} terms={x['fb_terms']:<3} "
-          f"lam={x['lam']:<5} {x['ndcg@10']:.4f}")
+Usage: python scripts/top.py k1b_rm3 [n]
+"""
+import json
+import sys
+
+name = sys.argv[1]
+n = int(sys.argv[2]) if len(sys.argv) > 2 else 15
+
+rows = json.load(open(f"runs/sweep_{name}.json"))
+rows.sort(key=lambda x: -x["ndcg@10"])
+
+keys = [k for k in rows[0] if k not in ("ndcg@10", "map@10", "mrr", "p@10")]
+for r in rows[:n]:
+    shown = "  ".join(f"{k}={r[k]}" for k in keys)
+    print(f"{shown:<45} {r['ndcg@10']:.4f}")

@@ -19,6 +19,7 @@ Implementation notes:
   - retrieve() scores with BM25 (Robertson & Zaragoza, 2009).
 """
 from typing import List, Optional, Tuple
+from submission import bm25, boolean_vsm, custom_scorer
 from submission import bm25, boolean_vsm
 
 from submission.corpus_utils import load_corpus
@@ -75,3 +76,17 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
     return bm25.score(query, k)
+
+def load_index(index_dir: str) -> None:
+    global _INDEX
+    _INDEX = InvertedIndex.load(index_dir)
+    _INDEX.decode_all()
+    _INDEX.build_forward()
+    bm25.build(_INDEX, k1=2.0, b=0.6)
+    boolean_vsm.build(_INDEX)
+    custom_scorer.build(_INDEX, fb_docs=10, fb_terms=20, lam=0.5)
+
+
+def retrieve(query, k=10):
+    ...
+    return custom_scorer.score(query, k)

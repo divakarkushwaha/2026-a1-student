@@ -62,3 +62,54 @@ def score(query: str, k: int = 10):
     cand = cand[acc[cand] > 0]
     cand = cand[np.argsort(-acc[cand], kind="stable")]
     return [(_index.doc_ids[int(d)], float(acc[d])) for d in cand]
+
+
+def score_internal(query, k):
+    """Like score(), but returns internal doc ids — for feedback."""
+    N = _index.N
+    acc = np.zeros(N, dtype=np.float64)
+    hit = False
+    for term in analyze(query):
+        i = _index.term_ids.get(term)
+        if i is None:
+            continue
+        p = _index.get_postings(term)
+        if p is None:
+            continue
+        docs, tfs = p
+        tfs = tfs.astype(np.float64)
+        contrib = _idf[i] * (tfs * (_k1 + 1.0)) / (tfs + _norm[docs])
+        np.add.at(acc, docs, contrib)
+        hit = True
+    if not hit:
+        return []
+    n = min(k, N)
+    cand = np.argpartition(-acc, n - 1)[:n]
+    cand = cand[acc[cand] > 0]
+    cand = cand[np.argsort(-acc[cand], kind="stable")]
+    return [(int(d), float(acc[d])) for d in cand]
+
+
+def score_weighted(term_weights, k=10):
+    """Score a bag of {term_id: weight} rather than a query string."""
+    N = _index.N
+    acc = np.zeros(N, dtype=np.float64)
+    hit = False
+    for i, qw in term_weights.items():
+        if qw <= 0:
+            continue
+        p = _index.get_postings(_index.terms[i])
+        if p is None:
+            continue
+        docs, tfs = p
+        tfs = tfs.astype(np.float64)
+        contrib = qw * _idf[i] * (tfs * (_k1 + 1.0)) / (tfs + _norm[docs])
+        np.add.at(acc, docs, contrib)
+        hit = True
+    if not hit:
+        return []
+    n = min(k, N)
+    cand = np.argpartition(-acc, n - 1)[:n]
+    cand = cand[acc[cand] > 0]
+    cand = cand[np.argsort(-acc[cand], kind="stable")]
+    return [(_index.doc_ids[int(d)], float(acc[d])) for d in cand]

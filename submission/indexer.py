@@ -82,6 +82,9 @@ class InvertedIndex:
         self.flat_docs = None
         self.flat_tfs = None
         self.starts = None
+        self.fwd_terms = None
+        self.fwd_tfs = None
+        self.doc_starts = None
 
     # ---------------------------------------------------------------
     def build(self, corpus: List[Tuple[str, str]]) -> None:
@@ -199,3 +202,35 @@ class InvertedIndex:
         gaps, pos = _vbyte_decode(self.postings, pos, n)
         tf_list, _ = _vbyte_decode(self.postings, pos, n)
         return np.cumsum(np.asarray(gaps, dtype=np.int32)), np.asarray(tf_list)
+
+    def build_forward(self) -> None:
+        """Invert the flat postings into a document-major layout.
+
+        Needed for relevance feedback, which asks what terms a given
+        document contains: the opposite of what an inverted index
+        answers. Built at load time from the already-decoded arrays
+        rather than persisted, so it costs nothing against the
+        index-size metric.
+        """
+        if self.flat_docs is None:
+            raise RuntimeError("call decode_all() first")
+
+        total = self.flat_docs.shape[0]
+        term_of = np.empty(total, dtype=np.int32)
+        for i in range(len(self.terms)):
+            term_of[self.starts[i]:self.starts[i + 1]] = i
+
+        counts = np.bincount(self.flat_docs, minlength=self.N)
+        doc_starts = np.empty(self.N + 1, dtype=np.int64)
+        doc_starts[0] = 0
+        np.cumsum(counts, out=doc_starts[1:])
+
+        order = np.argsort(self.flat_docs, kind="stable")
+        self.fwd_terms = term_of[order]
+        self.fwd_tfs = self.flat_tfs[order]
+        self.doc_starts = doc_starts
+
+    def doc_terms(self, docint):
+        """(term_ids, tfs) for one document."""
+        s, e = self.doc_starts[docint], self.doc_starts[docint + 1]
+        return self.fwd_terms[s:e], self.fwd_tfs[s:e]

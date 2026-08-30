@@ -251,8 +251,11 @@ class InvertedIndex:
         os.makedirs(index_dir, exist_ok=True)
         with open(os.path.join(index_dir, "terms.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(self.terms))
+        # All doc ids in this corpus are fixed 8-character strings, so
+        # the newline separator is pure overhead: 171K bytes of it.
+        # Written as a flat block and sliced by position on load.
         with open(os.path.join(index_dir, "docids.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(self.doc_ids))
+            f.write("".join(self.doc_ids))
         with open(os.path.join(index_dir, "postings.bin"), "wb") as f:
             f.write(self.postings)
         with open(os.path.join(index_dir, "tfs.bin"), "wb") as f:
@@ -274,7 +277,10 @@ class InvertedIndex:
         with open(os.path.join(index_dir, "terms.txt"), encoding="utf-8") as f:
             ix.terms = f.read().split("\n")
         with open(os.path.join(index_dir, "docids.txt"), encoding="utf-8") as f:
-            ix.doc_ids = f.read().split("\n")
+            blob = f.read()
+        DOCID_WIDTH = 8
+        ix.doc_ids = [blob[i:i + DOCID_WIDTH]
+                      for i in range(0, len(blob), DOCID_WIDTH)]
         with open(os.path.join(index_dir, "postings.bin"), "rb") as f:
             ix.postings = f.read()
         with open(os.path.join(index_dir, "tfs.bin"), "rb") as f:

@@ -70,29 +70,102 @@ def _vbyte_decode(buf, pos, count):
             shift += 7
     return nums, pos
 
+BLOCK = 128   # gaps per bitpacked block
 
-def _pack4(tfs) -> bytes:
-    """Pack term frequencies at 4 bits each, capped at TF_CAP.
 
-    Capping is safe because BM25's tf*(k1+1)/(tf + K) saturates: with
-    k1=2 the contribution at tf=15 is within a few percent of the
-    contribution at tf=495 (the corpus maximum), so the ranking effect
-    of the cap is negligible. Two tfs share one byte, low nibble first.
+def _bitpack_encode(gaps) -> bytes:
+    """Block-based bitpacking of doc-id gaps.
+
+    VByte cannot spend less than one byte per value, but gaps in a long
+    postings list are often 1 or 2 — a common term appears in nearly
+    consecutive documents. Splitting into blocks of BLOCK gaps and
+    packing each block at the minimum width its largest gap needs gets
+    below that floor: 128 gaps of value <= 3 cost 2 bits each (32 bytes
+    plus a 1-byte width header) instead of 128 bytes.
+
+    Layout per block: 1 byte width w, then BLOCK values of w bits each,
+    little-endian bit order, padded to a byte boundary. A trailing
+    partial block is padded with zeros to BLOCK values.
     """
-    t = np.minimum(np.asarray(tfs), TF_CAP).astype(np.uint8)
-    if len(t) % 2:
-        t = np.concatenate([t, np.zeros(1, dtype=np.uint8)])
-    packed = (t[0::2] | (t[1::2].astype(np.uint8) << np.uint8(4)))
-    return packed.astype(np.uint8).tobytes()
+    g = np.asarray(gaps, dtype=np.uint32)
+    out = bytearray()
+    for start in range(0, len(g), BLOCK):
+        block = g[start:start + BLOCK]
+        if len(block) < BLOCK:
+            block = np.concatenate(
+                [block, np.zeros(BLOCK - len(block), dtype=np.uint32)])
+        m = int(block.max())
+        w = max(1, int(m).bit_length())
+        out.append(w)
+        bits = np.unpackbits(
+            block.view(np.uint8).reshape(-1, 4)[:, ::-1], axis=1)[:, -w:]
+        out += np.packbits(bits.ravel()).tobytes()
+    return bytes(out)
 
 
-def _unpack4(buf, n):
-    """Inverse of _pack4; returns the first n term frequencies."""
+def _bitpack_decode(buf, pos, count):
+    """Decode `count` gaps written by _bitpack_encode. Returns
+    (gaps array, new_pos)."""
+    n_blocks = (count + BLOCK - 1) // BLOCK
+    out = np.empty(n_blocks * BLOCK, dtype=np.uint32)
+    for bi in range(n_blocks):
+        w = buf[pos]
+        pos += 1
+        nbytes = (BLOCK * w + 7) // 8
+        bits = np.unpackbits(
+            np.frombuffer(buf, dtype=np.uint8, count=nbytes, offset=pos))
+        pos += nbytes
+        vals = bits[:BLOCK * w].reshape(BLOCK, w)
+        padded = np.zeros((BLOCK, 32), dtype=np.uint8)
+        padded[:, -w:] = vals
+        out[bi * BLOCK:(bi + 1) * BLOCK] = np.packbits(
+            padded, axis=1)[:, ::-1].copy().view(np.uint32).ravel()
+    return out[:count], pos
+
+TF_INLINE_MAX = 3    # tf values 1..3 fit in the 2-bit code
+TF_ESCAPE = 3        # code 3 means "read the next exception"
+
+
+def _pack_tfs(tfs):
+    """Pack term frequencies at 2 bits each, with an exception list.
+
+    73% of postings have tf=1 and 88% have tf<=2, so even a 4-bit code
+    wastes most of its range. Codes 0,1,2 mean tf=1,2,3; code 3 says the
+    true value is the next entry in the exception array, which is stored
+    as uint16 (the corpus maximum tf is 495). At ~5% exceptions this
+    costs 0.25 bytes per posting plus a small side array, against 0.5
+    bytes for the 4-bit scheme.
+
+    Returns (packed_bytes, exceptions_uint16_array).
+    """
+    t = np.asarray(tfs, dtype=np.int64)
+    codes = np.where(t <= TF_INLINE_MAX, t - 1, TF_ESCAPE).astype(np.uint8)
+    exceptions = t[t > TF_INLINE_MAX].astype(np.uint16)
+
+    pad = (-len(codes)) % 4
+    if pad:
+        codes = np.concatenate([codes, np.zeros(pad, dtype=np.uint8)])
+    packed = (codes[0::4]
+              | (codes[1::4] << np.uint8(2))
+              | (codes[2::4] << np.uint8(4))
+              | (codes[3::4] << np.uint8(6)))
+    return packed.astype(np.uint8).tobytes(), exceptions
+
+
+def _unpack_tfs(buf, exceptions, n):
+    """Inverse of _pack_tfs; returns the first n term frequencies."""
     a = np.frombuffer(buf, dtype=np.uint8)
-    out = np.empty(len(a) * 2, dtype=np.int32)
-    out[0::2] = a & 0x0F
-    out[1::2] = a >> 4
-    return out[:n]
+    codes = np.empty(len(a) * 4, dtype=np.int32)
+    codes[0::4] = a & 0x03
+    codes[1::4] = (a >> 2) & 0x03
+    codes[2::4] = (a >> 4) & 0x03
+    codes[3::4] = (a >> 6) & 0x03
+    codes = codes[:n]
+
+    out = codes + 1
+    esc = codes == TF_ESCAPE
+    out[esc] = exceptions[:esc.sum()]
+    return out
 
 
 class InvertedIndex:
@@ -104,7 +177,8 @@ class InvertedIndex:
         self.df = None                 # np.uint32, parallel to terms
         self.offsets = None            # np.uint32, byte offset into blob
         self.postings: bytes = b""     # VByte doc-id gaps
-        self.packed_tfs: bytes = b""   # 4-bit term frequencies
+        self.packed_tfs: bytes = b""
+        self.tf_exceptions = None  
         self.N: int = 0
         self.avgdl: float = 0.0
         # populated by decode_all()
@@ -144,17 +218,29 @@ class InvertedIndex:
             plist = postings[t]          # ascending docint by construction
             offs.append(len(blob))
             df.append(len(plist))
+
             gaps, prev = [], 0
             for docint, _tf in plist:
                 gaps.append(docint - prev)
                 prev = docint
-            blob += _vbyte_encode(gaps)
+
+            # Bitpacking pays off only on lists long enough to fill
+            # blocks: 52% of terms are singletons, and padding a
+            # 1-gap list to a 128-value block would make it larger,
+            # not smaller. Short lists stay on VByte. One flag byte
+            # per term records which was used.
+            if len(gaps) >= BLOCK:
+                blob += b"\x01" + _bitpack_encode(gaps)
+            else:
+                blob += b"\x00" + _vbyte_encode(gaps)
+
             all_tfs.extend(tf for _d, tf in plist)
 
         self.df = np.array(df, dtype=np.uint32)
         self.offsets = np.array(offs, dtype=np.uint32)
         self.postings = bytes(blob)
-        self.packed_tfs = _pack4(np.array(all_tfs, dtype=np.int64))
+        self.packed_tfs, self.tf_exceptions = _pack_tfs(
+        np.array(all_tfs, dtype=np.int64))
 
     def document_frequency(self, term: str) -> int:
         i = self.term_ids.get(term)
@@ -178,7 +264,9 @@ class InvertedIndex:
             df=self.df.astype(np.uint32),
             offsets=self.offsets.astype(np.uint32),
             doc_lens=self.doc_lens.astype(np.uint16),
+            tf_exc=self.tf_exceptions,
         )
+        
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
@@ -194,6 +282,7 @@ class InvertedIndex:
         m = np.load(os.path.join(index_dir, "meta.npz"))
         ix.df = m["df"]
         ix.offsets = m["offsets"]
+        ix.tf_exceptions = m["tf_exc"]
         ix.doc_lens = m["doc_lens"].astype(np.uint32)
         ix.N = len(ix.doc_ids)
         ix.avgdl = float(ix.doc_lens.mean()) if ix.N else 0.0
@@ -217,16 +306,26 @@ class InvertedIndex:
         for i in range(n_terms):
             n = int(self.df[i])
             starts[i] = write
-            gaps, pos = _vbyte_decode(self.postings, pos, n)
-            docs[write:write + n] = np.cumsum(np.asarray(gaps, dtype=np.int32))
+
+            flag = self.postings[pos]
+            pos += 1
+            if flag:
+                gaps, pos = _bitpack_decode(self.postings, pos, n)
+                docs[write:write + n] = np.cumsum(gaps.astype(np.int32))
+            else:
+                gaps, pos = _vbyte_decode(self.postings, pos, n)
+                docs[write:write + n] = np.cumsum(
+                    np.asarray(gaps, dtype=np.int32))
+
             write += n
         starts[n_terms] = write
 
         self.flat_docs = docs
-        self.flat_tfs = _unpack4(self.packed_tfs, total)
+        self.flat_tfs = _unpack_tfs(self.packed_tfs, self.tf_exceptions, total)
         self.starts = starts
         self.postings = b""       # free the compressed copies
         self.packed_tfs = b""
+        self.tf_exceptions = None
 
     def get_postings(self, term: str):
         """(docints, tfs) for `term`, or None. decode_all() must have run."""

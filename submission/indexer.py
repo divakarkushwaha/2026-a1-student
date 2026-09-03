@@ -9,11 +9,17 @@ Design notes (for the report and defense):
     posting stores an int rather than repeating the doc_id string.
   - Within a postings list doc ids are ascending, so we store GAPS
     (deltas) rather than absolute ids. Gaps are small numbers.
-  - Long postings lists are bitpacked in blocks of 128 at the minimum
-    width the block needs; short lists stay on variable-byte, since
-    padding a 1-gap list to a 128-value block would make it larger.
+  - Long postings lists (df >= 128) are bitpacked in blocks at the
+    minimum bit width each block needs; shorter lists stay on
+    variable-byte, since padding a 1-gap list to a 128-value block
+    would make it larger rather than smaller. One flag byte per term
+    records which encoding was used.
   - Term frequencies are stored separately at 2 bits each with an
     exception list: 73% of postings have tf=1 and 88% have tf<=2.
+  - Terms occurring in a single document are pruned: 52.6% of the
+    vocabulary for 0.7% of postings.
+  - Doc ids are stored as a flat fixed-width block rather than
+    newline-separated.
   - Raw document text is deliberately NOT persisted. BM25 and VSM need
     only term frequencies and document lengths.
   - The compressed form is the on-disk form. decode_all() expands it
@@ -161,7 +167,6 @@ class InvertedIndex:
         self.terms: List[str] = []     # sorted vocabulary
         self.term_ids: Dict[str, int] = {}
         self.df = None                 # np.uint32, parallel to terms
-        self.offsets = None            # np.uint32, byte offset into blob
         self.postings: bytes = b""     # encoded doc-id gaps
         self.packed_tfs: bytes = b""   # 2-bit term frequency codes
         self.tf_exceptions = None      # uint16, tfs that did not fit
@@ -203,21 +208,21 @@ class InvertedIndex:
         self.avgdl = float(self.doc_lens.mean()) if self.N else 0.0
 
         self.terms = sorted(postings)
-                # Drop terms occurring in a single document. On a large corpus
+
+        # Drop terms occurring in a single document. On a large corpus
         # they are 52.6% of the vocabulary but 0.7% of postings, so
         # pruning costs almost no retrieval signal while removing half
-        # the dictionary, its offsets and its df entries. On a small
-        # corpus every term is nearly a singleton, so pruning is
-        # disabled below 1000 documents.
+        # the dictionary and its df entries. On a small corpus every
+        # term is nearly a singleton, so pruning is disabled below 1000
+        # documents.
         MIN_DF = 2 if len(corpus) > 1000 else 1
         self.terms = [t for t in self.terms if len(postings[t]) >= MIN_DF]
         self.term_ids = {t: i for i, t in enumerate(self.terms)}
 
-        df, offs, blob = [], [], bytearray()
+        df, blob = [], bytearray()
         all_tfs: List[int] = []
         for t in self.terms:
             plist = postings[t]          # ascending docint by construction
-            offs.append(len(blob))
             df.append(len(plist))
 
             gaps, prev = [], 0
@@ -233,7 +238,6 @@ class InvertedIndex:
             all_tfs.extend(tf for _d, tf in plist)
 
         self.df = np.array(df, dtype=np.uint32)
-        self.offsets = np.array(offs, dtype=np.uint32)
         self.postings = bytes(blob)
         self.packed_tfs, self.tf_exceptions = _pack_tfs(
             np.array(all_tfs, dtype=np.int64))
@@ -244,6 +248,9 @@ class InvertedIndex:
 
     # ---------------------------------------------------------------
     def save(self, index_dir: str) -> None:
+        """Persist the index. Byte offsets into the postings blob are
+        deliberately not stored: decode_all() walks the blob once,
+        sequentially, so per-term offsets would be dead weight."""
         os.makedirs(index_dir, exist_ok=True)
         with open(os.path.join(index_dir, "terms.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(self.terms))
@@ -257,7 +264,6 @@ class InvertedIndex:
         np.savez_compressed(
             os.path.join(index_dir, "meta.npz"),
             df=self.df.astype(np.uint32),
-            offsets=self.offsets.astype(np.uint32),
             doc_lens=self.doc_lens.astype(np.uint16),
             tf_exc=self.tf_exceptions,
             docid_width=np.array([w], dtype=np.uint16),
@@ -275,7 +281,6 @@ class InvertedIndex:
 
         m = np.load(os.path.join(index_dir, "meta.npz"))
         ix.df = m["df"]
-        ix.offsets = m["offsets"]
         ix.doc_lens = m["doc_lens"].astype(np.uint32)
         ix.tf_exceptions = m["tf_exc"]
         ix.docid_width = int(m["docid_width"][0])

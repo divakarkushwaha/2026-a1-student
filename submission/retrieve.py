@@ -11,19 +11,20 @@ rename them, change their signatures, or move them out of this file.
     retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]
 
 Implementation notes:
-  - build_index() tokenises the corpus, builds an inverted index with
-    delta+VByte-compressed postings, and persists it to index_dir.
-  - load_index() reconstructs that index in a fresh process, reading
-    only index_dir, and precomputes BM25's IDF and length-normalisation
-    arrays so retrieve() does no redundant work per query.
-  - retrieve() scores with BM25 (Robertson & Zaragoza, 2009).
+  - build_index() tokenises the corpus and builds an inverted index with
+    delta-encoded, bitpacked/VByte postings and 2-bit term frequencies,
+    then persists it to index_dir.
+  - load_index() reconstructs that index in a fresh process, reading only
+    index_dir, expands it into flat arrays, builds the document-major
+    forward index RM3 needs, and precomputes BM25's IDF and length
+    normalisation so retrieve() does no redundant per-query work.
+  - retrieve() scores with RM3 pseudo-relevance feedback over BM25
+    (Lavrenko & Croft 2001; Robertson & Zaragoza 2009).
 """
 from typing import List, Optional, Tuple
-from submission import bm25, boolean_vsm, custom_scorer
-from submission import bm25, boolean_vsm
 
 from submission.corpus_utils import load_corpus
-from submission import bm25
+from submission import bm25, boolean_vsm, custom_scorer
 from submission.indexer import InvertedIndex
 
 # ---------------------------------------------------------------------------
@@ -61,8 +62,10 @@ def load_index(index_dir: str) -> None:
     global _INDEX
     _INDEX = InvertedIndex.load(index_dir)
     _INDEX.decode_all()
+    _INDEX.build_forward()
     bm25.build(_INDEX, k1=2.0, b=0.6)
     boolean_vsm.build(_INDEX)
+    custom_scorer.build(_INDEX, fb_docs=10, fb_terms=20, lam=0.6)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
@@ -75,19 +78,4 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "processes — before any retrieve() calls. If you're testing "
             "manually, do the same."
         )
-    return bm25.score(query, k)
-
-def load_index(index_dir: str) -> None:
-    global _INDEX
-    _INDEX = InvertedIndex.load(index_dir)
-    _INDEX.decode_all()
-    _INDEX.build_forward()
-    bm25.build(_INDEX, k1=2.0, b=0.6)
-    boolean_vsm.build(_INDEX)
-    #custom_scorer.build(_INDEX, fb_docs=10, fb_terms=20, lam=0.5)
-    #custom_scorer.build(_INDEX, fb_docs=50, fb_terms=40, lam=0.35)
-    custom_scorer.build(_INDEX, fb_docs=10, fb_terms=20, lam=0.6)
-
-def retrieve(query, k=10):
-    ...
     return custom_scorer.score(query, k)

@@ -82,7 +82,7 @@ def load_index(index_dir: str) -> None:
     _INDEX = InvertedIndex.load(index_dir)
     _INDEX.decode_all()
     _INDEX.build_forward()
-    bm25.build(_INDEX, k1=1.2, b=0.75)
+    bm25.build(_INDEX, k1=2.0, b=0.6)
     boolean_vsm.build(_INDEX)
     #custom_scorer.build(_INDEX, fb_docs=10, fb_terms=20, lam=0.5)
     #custom_scorer.build(_INDEX, fb_docs=50, fb_terms=40, lam=0.35)
